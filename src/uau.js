@@ -13,7 +13,6 @@ let debugDirReady = null;
 
 function ensureDebugDir() {
   if (!debugDirReady) {
-    // limpa execuções antigas — é só material de debug, não precisa acumular
     debugDirReady = rm(DEBUG_ROOT, { recursive: true, force: true }).then(() =>
       mkdir(DEBUG_DIR, { recursive: true })
     );
@@ -49,7 +48,7 @@ function logError(msg, err) {
 
 function slug(text) {
   return text
-    .normalize('NFD').replace(/[̀-ͯ]/g, '') // remove acentos
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)/g, '')
@@ -109,8 +108,6 @@ async function pressKey(page, key, label = '') {
   await step(page, description, () => page.locator(CANVAS_SELECTOR).press(key));
 }
 
-// mesmo dia de hoje, só que no mês seguinte; se o mês seguinte não tiver esse
-// dia (ex: dia 31 caindo num mês de 30 dias), usa o último dia dele
 function nextMonthSameDay() {
   const today = new Date();
   const month = (today.getMonth() + 1) % 12;
@@ -120,9 +117,21 @@ function nextMonthSameDay() {
   return `${String(day).padStart(2, '0')}/${String(month + 1).padStart(2, '0')}/${year}`;
 }
 
-export async function runUauXtFlow(page) {
+function formatValorBR(valor) {
+  if (typeof valor === 'number') return valor.toFixed(2).replace('.', ',');
+  return String(valor);
+}
+
+/**
+ * Login no UAU XT + abertura do módulo de manutenções. Roda uma única vez
+ * por sessão de navegador — chamar de novo sem deslogar antes deixa o app
+ * num estado inesperado (ele "lembra" onde parou).
+ */
+export async function loginUau(page) {
   await ensureDebugDir();
   log(`Screenshots de cada passo vão em: ${DEBUG_DIR}`);
+
+  const { UAU_USER = 'Almaz', UAU_PASSWORD = '123' } = process.env;
 
   log('Aguardando o UAU XT carregar...');
   await wait(10000);
@@ -130,13 +139,13 @@ export async function runUauXtFlow(page) {
   await clickCanvas(page, 55, 312, 'abre tela de login/seleção do UAU');
   await wait(8000);
 
-  await typeText(page, 'Almaz');
+  await typeText(page, UAU_USER);
   await wait(8000);
 
   await clickCanvas(page, 950, 335, 'campo de senha/PIN');
   await wait(8000);
 
-  await typeText(page, '123');
+  await typeText(page, UAU_PASSWORD);
   await wait(8000);
 
   await pressKey(page, 'Enter', 'confirma login');
@@ -153,27 +162,32 @@ export async function runUauXtFlow(page) {
   await typeText(page, 'manutencoes');
   await wait(10000);
 
-  // navegação após abrir a busca "manutencoes" — ainda não sei o que cada
-  // clique abaixo seleciona (opção de menu / confirmação), só as coordenadas
-  // gravadas; ajustar label quando o fluxo completo for confirmado
   await clickCanvas(page, 219, 353);
   await wait(5000);
 
   await clickCanvas(page, 96, 262);
   await wait(5000);
 
+  log('Login e abertura do módulo de manutenções concluídos.');
+}
+
+export async function processarCota(page, { obra, numVenda, valorPago, jurosMulta } = {}) {
+  if (!obra || !numVenda || valorPago == null || jurosMulta == null) {
+    throw new Error(`processarCota precisa de obra, numVenda, valorPago e jurosMulta (recebido: obra=${obra} numVenda=${numVenda} valorPago=${valorPago} jurosMulta=${jurosMulta})`);
+  }
+
+  log(`Processando cota: obra=${obra} numVenda=${numVenda} valorPago=${formatValorBR(valorPago)} jurosMulta=${formatValorBR(jurosMulta)}`);
+
   await clickCanvas(page, 137, 108);
   await wait(5000);
 
-  // sequência nova — cliques ainda não confirmados; espera Enter no terminal
-  // antes de cada um pra dar tempo de anotar o que ele faz
   await clickCanvas(page, 412, 109);
   await wait(5000);
 
   await clickCanvas(page, 580, 186);
   await wait(5000);
 
-  await typeText(page, 'watdb'); // obra
+  await typeText(page, obra);
   await wait(5000);
 
   await clickCanvas(page, 337, 211);
@@ -185,7 +199,7 @@ export async function runUauXtFlow(page) {
   await clickCanvas(page, 482, 105);
   await wait(5000);
 
-  await typeText(page, '1918'); // número da venda
+  await typeText(page, numVenda);
   await wait(5000);
 
   await dblClickCanvas(page, 235, 165);
@@ -245,15 +259,13 @@ export async function runUauXtFlow(page) {
   await clickCanvas(page, 328, 351);
   await wait(5000);
 
-  // valor real = metade do saldo a devolver (varia por venda); por enquanto
-  // digita o texto literal só pra testar o fluxo, trocar depois pelo cálculo
-  await typeText(page, '1149,78');
+  await typeText(page, formatValorBR(valorPago));
   await wait(5000);
 
   await clickCanvas(page, 461, 351);
   await wait(5000);
 
-  await typeText(page, 'Multa de quebra contratual (50%)'); // Multa de quebra contratual (50%)
+  await typeText(page, 'Multa de quebra contratual (50%)'); 
   await wait(5000);
 
   await clickCanvas(page, 985, 352);
@@ -274,7 +286,7 @@ export async function runUauXtFlow(page) {
   // await typeText(page, 'Juros e multa');
   // await waitForEnter();
 
-  await typeText(page, '40,22'); // juros + multa somados
+  await typeText(page, formatValorBR(jurosMulta)); // juros + multa somados
   await wait(5000);
 
   await clickCanvas(page, 485, 349); 
@@ -351,5 +363,5 @@ export async function runUauXtFlow(page) {
   await clickCanvas(page, 1021, 12);
   await wait(5000);
 
-  log('Fluxo UAU XT concluído.');
+  log(`Cota processada (obra=${obra} numVenda=${numVenda}).`);
 }

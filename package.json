@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
+    "preview": "node src/preview.js",
     "test:browser": "node src/browser.js"
   },
   "dependencies": {

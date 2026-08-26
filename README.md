@@ -1,13 +1,24 @@
 # Bot Almaz
 
-Automação 100% em cima do Playwright:
-1. Login no Gamma (formulário web comum).
-2. O app RemoteApp (UAU XT) é acessado no modo **HTML5**, que roda dentro
-   de um `<canvas>` (`#JWTS_myCanvas`) na própria página — sem diálogo
-   nativo do Chrome nem processo desktop separado.
-3. Como o conteúdo do canvas é só uma imagem (stream), a interação com o
-   UAU XT é feita por **clique em coordenada fixa** dentro do canvas,
-   seguido de digitação via teclado (`page.keyboard.type`).
+Automação em cima do Playwright, processando um lote de cotas por execução:
+1. Lê a planilha do SharePoint (via Microsoft Graph API) e filtra as
+   linhas com `Status = Normal` — cada uma tem `empresa`, `obra` e
+   `num_ven` (coluna "Venda" na planilha).
+2. Login no Gamma + UAU XT feito **uma única vez** (`loginUau()` em
+   `src/uau.js`) — o UAU não pode ser deslogado no meio do lote sem
+   perder o estado, então a mesma sessão é reaproveitada pra todas as
+   cotas.
+3. Para cada linha pendente, em sequência:
+   - Autentica na API REST do UAU e busca as parcelas recebidas daquela
+     venda, calculando `valor_pago` (regra de negócio em `src/uauApi.js`).
+   - Roda `processarCota(page, { obra, numVenda, valorPago })` — clique em
+     coordenada fixa dentro do canvas (`#JWTS_myCanvas`), seguido de
+     digitação via teclado (`page.keyboard.type`), incluindo o
+     `valor_pago` calculado.
+   - Grava `Status = Cancelado` de volta na planilha só depois do
+     `processarCota` terminar sem erro.
+   - Se uma cota falhar, o erro é logado e o loop segue pra próxima —
+     uma cota travada não derruba o lote inteiro.
 
 ## Como rodar
 
@@ -15,6 +26,7 @@ Automação 100% em cima do Playwright:
 npm install
 npx playwright install chromium   # baixa o navegador que o Playwright usa
 cp .env.example .env              # se ainda não existir; já veio preenchido pra você
+npm run preview                   # conferir quais cotas seriam canceladas e por qual valor, sem tocar no UAU
 npm start
 ```
 
@@ -25,15 +37,23 @@ npm start
 | `GAMMA_URL` | URL do portal Gamma |
 | `GAMMA_USER` / `GAMMA_PASSWORD` | Login do Gamma (formulário web) |
 | `UAU_USER` / `UAU_PASSWORD` | Login do UAU XT (dentro do canvas) |
+| `SP_TENANT_ID` / `SP_CLIENT_ID` / `SP_CLIENT_SECRET` | App Registration no Azure AD (permissão de aplicativo `Sites.Read.All` ou `Files.Read.All`, com consentimento de admin) usado pra autenticar no Microsoft Graph |
+| `SP_FILE_SHARE_URL` | Link "Copiar link" da planilha no SharePoint (o próprio `https://.../doc.aspx?sourcedoc={...}` funciona) — resolvido via API `/shares` do Graph |
+| `SP_SHEET_NAME` | Nome da aba da planilha que tem as colunas `Empresa`, `Obra`, `Venda`, `Status` |
+| `UAU_API_BASE_URL` | Base da API REST do UAU (`.../uauAPI/api/v1`) |
+| `UAU_API_INTEGRATION_TOKEN` | Valor fixo do header `X-INTEGRATION-Authorization` |
+| `UAU_API_LOGIN` / `UAU_API_SENHA` | Credenciais do `POST /Autenticador/AutenticarUsuario` |
 
 ## Estrutura
 
 ```
 bot-almaz/
 ├── src/
-│   ├── browser.js   → Playwright: login no Gamma
-│   ├── uau.js        → Playwright: cliques por coordenada no canvas do UAU XT
-│   └── index.js      → orquestra os dois em sequência
+│   ├── sharepoint.js → Microsoft Graph API: lê a planilha e grava o Status de volta
+│   ├── uauApi.js      → API REST do UAU: autentica e calcula valor_pago
+│   ├── browser.js     → Playwright: login no Gamma
+│   ├── uau.js          → Playwright: loginUau() (uma vez) + processarCota() (por linha)
+│   └── index.js        → orquestra tudo: lê planilha → loga → loop de cotas
 ├── assets/icons/     → prints de referência (não usados mais pelo código;
 │                        mantidos como documentação visual das telas)
 ├── .env
@@ -55,6 +75,14 @@ viewport do navegador for o mesmo usado na gravação (`1280x720`, fixado
 em `browser.js`). Se um dia o layout do UAU XT mudar ou o viewport for
 alterado, as coordenadas em `uau.js` precisam ser regravadas.
 
+**Ponto de reinício entre cotas:** depois que `processarCota()` termina
+uma cota (último clique em `(1021, 12)`), o UAU volta pro mesmo estado de
+tela que existia logo após `clickCanvas(page, 96, 262)` em `loginUau()`
+— por isso `processarCota()` pode ser chamado de novo direto, começando
+em `clickCanvas(page, 137, 108)`, sem precisar relogar. Se esse
+comportamento mudar (ex: layout do UAU for alterado), esse ponto de
+corte entre `loginUau()` e `processarCota()` precisa ser revalidado.
+
 ## Limitações conhecidas / decisões já tomadas, não reabrir
 
 - **Rodar em servidor**: fase futura, não resolver agora.
@@ -74,8 +102,22 @@ alterado, as coordenadas em `uau.js` precisam ser regravadas.
 - **Credenciais**: estão no `.env`, que já está no `.gitignore`. Nunca
   suba esse arquivo pra um repositório Git público ou compartilhado.
 
+## Regra de negócio (`src/uauApi.js`)
+
+`BuscarParcelasRecebidas` retorna `[{ Recebidas: [...] }]` (serialização
+de DataSet do .NET) — o array de parcelas de verdade é `Recebidas`, cujo
+item `[0]` é uma linha de schema (tipo `"System.Decimal, mscorlib, ..."`)
+e deve ser descartado. Para os itens restantes (`calcularValorFinalDeParcelas()`):
+
+1. **`valor_pago`**: soma `ValorConf_Rec + VlCorrecaoConf_Rec` de
+   **todas** as parcelas (o cliente pode ter pago várias) → `valorTotal`,
+   só depois divide por 2 → `valorFinal` (= `valor_pago` usado no canvas).
+2. **`jurosMulta`**: soma `VlJurosParcConf_Rec + VlMulta_Rec` de todas as
+   parcelas → `jurosMultaTotal` (sem dividir por 2) — vai no campo "Juros
+   e multa" do canvas.
+
 ## Próximos passos (fora do escopo inicial)
 
-O usuário mencionou que tem "muito mais coisa" — quando estiver pronto
-pra detalhar, dá pra ir encaixando como novos passos dentro de
-`runUauXtFlow()` em `src/uau.js`.
+- O usuário mencionou que tem "muito mais coisa" — quando estiver pronto
+  pra detalhar, dá pra ir encaixando como novos passos dentro de
+  `processarCota()` em `src/uau.js`.
